@@ -1,12 +1,20 @@
 /**
  * @name EmbedFixer
- * @version 0.4.0
+ * @version 0.5.0
  * @description Automatically replaces social media links with better embed alternatives
  * @author K33bs
  * @website https://github.com/k33bs/EmbedFixer
  * @updateUrl https://github.com/k33bs/EmbedFixer/blob/main/EmbedFixer.plugin.js
- * @changelogDate 2025-12-08
+ * @changelogDate 2025-12-09
  * @changelog
+ * ## 0.5.0
+ * - Now also fixes links when editing messages (not just sending)
+ * - Smart edit detection: only skips re-fixing if you're reverting a fixed domain back to original (e.g., fixupx.com → twitter.com)
+ * - Major performance improvement: tokenize message once instead of 7 times
+ * - Pre-compile expensive regexes at startup instead of on every message
+ * - Fixed song.link URL encoding to use proper encodeURIComponent
+ * - Added type safety check for message content
+ * - Updated stop() to also restore editMessage
  * ## 0.4.0
  * - Added per-platform toggle settings - enable/disable individual fixers
  * - Added tracking parameter stripping (utm, fbclid, igshid, gclid, and 80+ more)
@@ -135,8 +143,306 @@ module.exports = class EmbedFixer {
 		}
 	}
 
+	// Pre-compile expensive regexes once at startup
+	compileRegexes() {
+		// Central embed replacements config - single source of truth
+		// Each entry has: toggle key, pattern, replacement, name, original domains (for revert detection)
+		this.embedReplacements = [
+			{
+				key: "twitter",
+				pattern: /https?:\/\/(?:www\.)?(?:x|twitter)\.com/gi,
+				replacement: "https://fixupx.com",
+				name: "X/Twitter",
+				originals: ["twitter.com", "x.com"],
+				fixed: "fixupx.com",
+			},
+			{
+				key: "reddit",
+				pattern: /https?:\/\/(?:www\.)?reddit\.com/gi,
+				replacement: "https://rxddit.com",
+				name: "Reddit",
+				originals: ["reddit.com"],
+				fixed: "rxddit.com",
+			},
+			{
+				key: "tiktok",
+				pattern: /https?:\/\/(?:(?:www|m|vm|vt)\.)?tiktok\.com/gi,
+				replacement: "https://tnktok.com",
+				name: "TikTok",
+				originals: ["tiktok.com"],
+				fixed: "tnktok.com",
+			},
+			{
+				key: "instagram",
+				pattern: /https?:\/\/(?:www\.)?instagram\.com/gi,
+				replacement: "https://ddinstagram.com",
+				name: "Instagram",
+				originals: ["instagram.com"],
+				fixed: "ddinstagram.com",
+			},
+			{
+				key: "bluesky",
+				pattern: /https?:\/\/(?:www\.)?bsky\.app/gi,
+				replacement: "https://bsyy.app",
+				name: "Bluesky",
+				originals: ["bsky.app"],
+				fixed: "bsyy.app",
+			},
+			{
+				key: "threads",
+				pattern: /https?:\/\/(?:www\.)?threads\.net/gi,
+				replacement: "https://fixthreads.net",
+				name: "Threads",
+				originals: ["threads.net"],
+				fixed: "fixthreads.net",
+			},
+			{
+				key: "pixiv",
+				pattern: /https?:\/\/(?:www\.)?pixiv\.net/gi,
+				replacement: "https://phixiv.net",
+				name: "Pixiv",
+				originals: ["pixiv.net"],
+				fixed: "phixiv.net",
+			},
+			{
+				key: "twitch",
+				pattern: /https?:\/\/(?:www\.)?clips\.twitch\.tv/gi,
+				replacement: "https://clips.fxtwitch.tv",
+				name: "Twitch Clips",
+				originals: ["clips.twitch.tv"],
+				fixed: "clips.fxtwitch.tv",
+			},
+			{
+				key: "medium",
+				pattern: /https?:\/\/(?:www\.)?medium\.com/gi,
+				replacement: "https://scribe.rip",
+				name: "Medium",
+				originals: ["medium.com"],
+				fixed: "scribe.rip",
+			},
+			{
+				key: "tumblr",
+				pattern: /https?:\/\/(?:www\.)?tumblr\.com/gi,
+				replacement: "https://tpmblr.com",
+				name: "Tumblr",
+				originals: ["tumblr.com"],
+				fixed: "tpmblr.com",
+			},
+			{
+				key: "deviantart",
+				pattern: /https?:\/\/(?:www\.)?deviantart\.com/gi,
+				replacement: "https://fixdeviantart.com",
+				name: "DeviantArt",
+				originals: ["deviantart.com"],
+				fixed: "fixdeviantart.com",
+			},
+			{
+				key: "fourchan",
+				pattern: /https?:\/\/boards\.4chan\.org/gi,
+				replacement: "https://boards.4channel.org",
+				name: "4chan",
+				originals: ["boards.4chan.org"],
+				fixed: "boards.4channel.org",
+			},
+			{
+				key: "giphy",
+				pattern:
+					/https?:\/\/(?:www\.)?giphy\.com\/gifs\/(?:[\w-]+-)?([a-zA-Z0-9]{8,20})(?:\/?(?=\s|$)|\/?$)/gi,
+				replacement: (match, gifId) =>
+					`https://media.giphy.com/media/${gifId}/giphy.gif`,
+				name: "Giphy",
+				originals: ["giphy.com/gifs"],
+				fixed: "media.giphy.com/media",
+			},
+			{
+				key: "gist",
+				pattern:
+					/https?:\/\/gist\.github\.com\/([a-zA-Z0-9-]+)\/([a-fA-F0-9]+)(?:\/[\w-]+)?(?:#.*)?/gi,
+				replacement: "https://gist.githubusercontent.com/$1/$2/raw",
+				name: "GitHub Gist",
+				originals: ["gist.github.com"],
+				fixed: "gist.githubusercontent.com",
+			},
+			{
+				key: "pastebin",
+				pattern: /https?:\/\/(?:www\.)?pastebin\.com\/(?!raw\/)([\w]+)/gi,
+				replacement: "https://pastebin.com/raw/$1",
+				name: "Pastebin",
+				originals: [], // No revert detection - same domain
+				fixed: "pastebin.com/raw",
+			},
+			{
+				key: "imgur",
+				pattern:
+					/(https?:\/\/)(?:www\.)?imgur\.com\/(?!a\/|gallery\/)([\w]+)(?:\.(\w+))?/gi,
+				replacement: (match, _proto, id, ext) =>
+					"https://i.imgur.com/" + id + (ext ? "." + ext : ".png"),
+				name: "Imgur",
+				originals: ["imgur.com"],
+				fixed: "i.imgur.com",
+			},
+			{
+				key: "steam",
+				pattern:
+					/https?:\/\/store\.steampowered\.com\/app\/(\d+)(?:\/[^\s]*)?/gi,
+				replacement: (match, appId) => `https://steamdb.info/app/${appId}/`,
+				name: "Steam Store",
+				originals: ["store.steampowered.com/app"],
+				fixed: "steamdb.info/app",
+			},
+		];
+
+		// AMP domains whitelist
+		this.ampDomains = [
+			"cnn",
+			"bbc",
+			"theguardian",
+			"nytimes",
+			"washingtonpost",
+			"reuters",
+			"forbes",
+			"wired",
+			"techcrunch",
+			"theverge",
+			"engadget",
+			"arstechnica",
+			"businessinsider",
+			"huffpost",
+			"nbcnews",
+			"cbsnews",
+			"abcnews",
+			"usatoday",
+			"time",
+			"newsweek",
+			"thehill",
+			"politico",
+			"vox",
+			"slate",
+			"salon",
+			"dailymail",
+			"independent",
+			"telegraph",
+			"mirror",
+			"express",
+			"standard",
+			"9to5google",
+			"9to5mac",
+			"androidcentral",
+			"tomsguide",
+			"cnet",
+			"zdnet",
+		];
+		const ampDomainsPattern = this.ampDomains.join("|");
+		this.ampSubdomainRegex = new RegExp(
+			`https?:\\/\\/amp\\.((?:${ampDomainsPattern})\\.\\w+)(\\/[^\\s]*)?`,
+			"gi"
+		);
+
+		// Paywalled domains
+		this.paywalledDomains = [
+			"nytimes.com",
+			"wsj.com",
+			"washingtonpost.com",
+			"ft.com",
+			"economist.com",
+			"theathletic.com",
+			"businessinsider.com",
+			"theatlantic.com",
+			"newyorker.com",
+			"wired.com",
+			"vanityfair.com",
+			"bloomberg.com",
+			"barrons.com",
+			"forbes.com",
+			"fortune.com",
+			"seekingalpha.com",
+			"thedailybeast.com",
+			"politico.com",
+			"thetimes.co.uk",
+			"telegraph.co.uk",
+			"thesundaytimes.co.uk",
+			"spectator.co.uk",
+			"newstatesman.com",
+			"lemonde.fr",
+			"corriere.it",
+			"bild.de",
+			"spiegel.de",
+			"nikkei.com",
+			"haaretz.com",
+			"scmp.com",
+			"afr.com",
+			"theage.com.au",
+			"smh.com.au",
+			"latimes.com",
+			"chicagotribune.com",
+			"bostonglobe.com",
+			"sfchronicle.com",
+			"seattletimes.com",
+			"miamiherald.com",
+			"denverpost.com",
+			"startribune.com",
+			"inquirer.com",
+			"dallasnews.com",
+			"theinformation.com",
+			"stratechery.com",
+			"protocol.com",
+			"arstechnica.com",
+			"harpers.org",
+			"thenation.com",
+			"foreignpolicy.com",
+			"medium.com",
+			"substack.com",
+		];
+		const domainPattern = this.paywalledDomains
+			.map((d) => d.replace(/\./g, "\\."))
+			.join("|");
+		this.paywallRegex = new RegExp(
+			`(https?:\\/\\/(?:[\\w-]+\\.)?(?:${domainPattern})\\/[^\\s]+?)((?:[\\.,!\\?\\)\\]\\}>\\\"]|&amp;)+)?(?=\\s|$)`,
+			"gi"
+		);
+
+		// Music patterns for song.link
+		this.musicPatterns = [
+			/https?:\/\/open\.spotify\.com\/(track|album|playlist|artist)\/([a-zA-Z0-9]+)(\?[^\s]*)?/gi,
+			/https?:\/\/music\.apple\.com\/[a-z]{2}\/(album|playlist|song|artist)\/[^\s]+/gi,
+			/https?:\/\/music\.youtube\.com\/(watch\?v=|playlist\?list=|channel\/)[^\s]+/gi,
+			/https?:\/\/(?:listen\.)?tidal\.com\/(track|album|playlist|artist)\/[^\s]+/gi,
+			/https?:\/\/(?:www\.)?deezer\.com\/[a-z]{2}\/(track|album|playlist|artist)\/[^\s]+/gi,
+			/https?:\/\/music\.amazon\.com\/[^\s]+/gi,
+			/https?:\/\/soundcloud\.com\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+(?:\?[^\s]*)?/gi,
+		];
+
+		// URL regex for tracking param stripping
+		this.urlRegex = /(https?:\/\/[^\s<>\[\]()]+)/gi;
+
+		// YouTube Shorts pattern
+		this.ytShortsPattern =
+			/https?:\/\/(?:(?:www|m)\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]{5,})(\?[^\s]*)?/gi;
+
+		// Trailing punctuation pattern (used in multiple methods)
+		this.trailingPunctRegex = /([.,!?)\]}>]+)$/;
+
+		// Amazon product URL patterns
+		this.amazonProductRegex =
+			/(https?:\/\/(?:www\.)?amazon\.(?:com|co\.uk|de|fr|it|es|ca|com\.au|co\.jp|in|com\.br|com\.mx|nl|se|pl|sg|ae|sa|eg|tr))\/(.*?\/)?(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})(?:\/[^\s]*)?/gi;
+		this.amazonTrackingRegex =
+			/(https?:\/\/(?:www\.)?amazon\.[a-z.]+\/[^\s?]+)\?[^\s]*/gi;
+
+		// AMP patterns
+		this.googleAmpCacheRegex =
+			/https?:\/\/(?:www\.)?google\.com\/amp\/s\/([^\s]+)/gi;
+		this.googleAmpViewerRegex =
+			/https?:\/\/(?:www\.)?google\.com\/amp\/([^\s]+)/gi;
+		this.bingAmpRegex = /https?:\/\/(?:www\.)?bing\.com\/amp\/s\/([^\s]+)/gi;
+		this.ampPathRegex = /(https?:\/\/[^\s\/]+)\/amp(\/[^\s]*)?/gi;
+
+		// Code block tokenization pattern
+		this.codeBlockRegex = /(```[\s\S]*?```|`[^`]*`)/g;
+	}
+
 	start() {
 		this.loadSettings();
+		this.compileRegexes();
 		this.log("plugin started");
 
 		// safely get the message module using the recommended getByKeys method
@@ -150,47 +456,72 @@ module.exports = class EmbedFixer {
 		}
 
 		this.originalSendMessage = messageModule.sendMessage;
+		this.originalEditMessage = messageModule.editMessage;
+
+		// Helper to process message content - tokenizes once and processes all
+		const processContent = (text) => {
+			if (typeof text !== "string") return text;
+
+			// Tokenize once: split by code blocks and inline code
+			this.codeBlockRegex.lastIndex = 0;
+			const parts = text.split(this.codeBlockRegex);
+
+			const processedParts = parts.map((part) => {
+				// Skip code blocks (they start with backtick)
+				if (part.startsWith("`")) return part;
+
+				let processed = part;
+
+				// Strip tracking parameters first (cleanest URLs)
+				if (this.platformToggles.trackingParams) {
+					processed = this.stripTrackingParams(processed);
+				}
+
+				// Remove AMP wrappers
+				if (this.platformToggles.ampLinks) {
+					processed = this.removeAmpLinks(processed);
+				}
+
+				// Clean Amazon links
+				if (this.platformToggles.amazonClean) {
+					processed = this.cleanAmazonLinks(processed);
+				}
+
+				// Apply all the embed replacements
+				processed = this.applyReplacements(processed);
+
+				// Convert music links to song.link
+				if (this.platformToggles.songLink) {
+					processed = this.processSongLinks(processed);
+				}
+
+				// Wrap paywalled urls
+				if (this.platformToggles.paywall) {
+					processed = this.processPaywalls(processed);
+				}
+
+				// Handle youtube shorts
+				if (this.platformToggles.youtubeShorts) {
+					processed = this.processYouTubeShorts(processed);
+				}
+
+				return processed;
+			});
+
+			return processedParts.join("");
+		};
+
+		// Cache for tracking message content (for smart edit detection)
+		this.messageContentCache = new Map();
 
 		messageModule.sendMessage = async (channelId, content, ...args) => {
 			try {
-				if (content && content.content) {
+				if (content && typeof content.content === "string") {
 					const originalContent = content.content;
 					this.log("processing message:", originalContent);
 
-					// Strip tracking parameters first (cleanest URLs)
-					if (this.platformToggles.trackingParams) {
-						content.content = this.stripTrackingParams(content.content);
-					}
+					content.content = processContent(content.content);
 
-					// Remove AMP wrappers
-					if (this.platformToggles.ampLinks) {
-						content.content = this.removeAmpLinks(content.content);
-					}
-
-					// Clean Amazon links
-					if (this.platformToggles.amazonClean) {
-						content.content = this.cleanAmazonLinks(content.content);
-					}
-
-					// Apply all the embed replacements
-					content.content = this.applyReplacements(content.content);
-
-					// Convert music links to song.link
-					if (this.platformToggles.songLink) {
-						content.content = this.processSongLinks(content.content);
-					}
-
-					// Wrap paywalled urls
-					if (this.platformToggles.paywall) {
-						content.content = this.processPaywalls(content.content);
-					}
-
-					// Handle youtube shorts
-					if (this.platformToggles.youtubeShorts) {
-						content.content = this.processYouTubeShorts(content.content);
-					}
-
-					// Log final result if we changed anything
 					if (originalContent !== content.content) {
 						this.log("final message:", content.content);
 					} else {
@@ -199,44 +530,95 @@ module.exports = class EmbedFixer {
 				}
 			} catch (error) {
 				console.error("[EmbedFixer] Error processing message:", error);
-				// just continue with original message if something breaks
 			}
 
-			// always return the result of the original function (bind to original module)
-			return await this.originalSendMessage.call(
+			const result = await this.originalSendMessage.call(
 				messageModule,
 				channelId,
 				content,
 				...args
 			);
-		};
-	}
 
-	// helper: apply replacements only outside code blocks (``` ... ```)
-	// and inline code (`...`).
-	replaceOutsideCode(text, replacer) {
-		if (!text) return text;
-		const fenceSplit = text.split(/```/);
-		for (let i = 0; i < fenceSplit.length; i++) {
-			// even indices are outside fenced code
-			if (i % 2 === 0) {
-				const segment = fenceSplit[i];
-				const inlineSplit = segment.split(/`/);
-				// If backticks are unbalanced, avoid inline toggling and process segment as a whole
-				if (inlineSplit.length % 2 !== 1) {
-					fenceSplit[i] = replacer(segment);
-				} else {
-					for (let j = 0; j < inlineSplit.length; j++) {
-						// even indices are outside inline code
-						if (j % 2 === 0) {
-							inlineSplit[j] = replacer(inlineSplit[j]);
+			// Cache the sent message content for edit comparison
+			// Result contains the message ID after sending
+			try {
+				if (result && result.id && content && content.content) {
+					this.messageContentCache.set(result.id, content.content);
+					// Limit cache size to prevent memory issues
+					if (this.messageContentCache.size > 100) {
+						const firstKey = this.messageContentCache.keys().next().value;
+						this.messageContentCache.delete(firstKey);
+					}
+				}
+			} catch (e) {
+				// Ignore caching errors
+			}
+
+			return result;
+		};
+
+		// Check if user is reverting: fixed domain disappeared AND its original appeared
+		// Uses the central embedReplacements config
+		const isRevertingFixedLink = (oldText, newText) => {
+			for (const { fixed, originals } of this.embedReplacements) {
+				if (!originals || originals.length === 0) continue;
+				// Was the fixed domain in the old text?
+				if (oldText.includes(fixed)) {
+					// Is it gone now AND an original domain appeared?
+					if (!newText.includes(fixed)) {
+						for (const original of originals) {
+							if (newText.includes(original) && !oldText.includes(original)) {
+								return { fixed, original };
+							}
 						}
 					}
-					fenceSplit[i] = inlineSplit.join("`");
 				}
 			}
-		}
-		return fenceSplit.join("```");
+			return null;
+		};
+
+		messageModule.editMessage = async (
+			channelId,
+			messageId,
+			content,
+			...args
+		) => {
+			try {
+				if (content && typeof content.content === "string") {
+					const newContent = content.content;
+					const oldContent = this.messageContentCache.get(messageId) || "";
+
+					// Check if user is intentionally reverting a fixed link
+					const revert = isRevertingFixedLink(oldContent, newContent);
+					if (revert) {
+						this.log(
+							`skipping edit - user reverted ${revert.fixed} to ${revert.original}`
+						);
+						// Update cache with the reverted content (don't re-fix on subsequent edits)
+						this.messageContentCache.set(messageId, newContent);
+					} else {
+						this.log("processing edit:", newContent);
+						content.content = processContent(newContent);
+
+						if (newContent !== content.content) {
+							this.log("final edit:", content.content);
+						}
+						// Cache the processed content
+						this.messageContentCache.set(messageId, content.content);
+					}
+				}
+			} catch (error) {
+				console.error("[EmbedFixer] Error processing edit:", error);
+			}
+
+			return await this.originalEditMessage.call(
+				messageModule,
+				channelId,
+				messageId,
+				content,
+				...args
+			);
+		};
 	}
 
 	// Tracking parameters to strip from URLs
@@ -402,494 +784,147 @@ module.exports = class EmbedFixer {
 		];
 	}
 
-	stripTrackingParams(content) {
-		// Match URLs and strip tracking params
-		const urlRegex = /(https?:\/\/[^\s<>\[\]()]+)/gi;
-
-		const newContent = this.replaceOutsideCode(content, (segment) => {
-			return segment.replace(urlRegex, (url) => {
-				try {
-					// Handle URLs that might end with punctuation
-					let trailingPunct = "";
-					const punctMatch = url.match(/([.,!?)\]}>]+)$/);
-					if (punctMatch) {
-						trailingPunct = punctMatch[1];
-						url = url.slice(0, -trailingPunct.length);
-					}
-
-					const urlObj = new URL(url);
-
-					// Optimized: iterate URL's params and check against Set (case-insensitive)
-					const paramsToDelete = [];
-					urlObj.searchParams.forEach((_, key) => {
-						if (this.trackingParamsSet.has(key.toLowerCase())) {
-							paramsToDelete.push(key);
-						}
-					});
-
-					if (paramsToDelete.length > 0) {
-						paramsToDelete.forEach((p) => urlObj.searchParams.delete(p));
-						this.log("stripped tracking params from:", url);
-						// Remove trailing ? if no params left
-						let cleanUrl = urlObj.toString();
-						if (cleanUrl.endsWith("?")) {
-							cleanUrl = cleanUrl.slice(0, -1);
-						}
-						return cleanUrl + trailingPunct;
-					}
-					return url + trailingPunct;
-				} catch (e) {
-					return url;
+	stripTrackingParams(segment) {
+		this.urlRegex.lastIndex = 0;
+		return segment.replace(this.urlRegex, (url) => {
+			try {
+				let trailingPunct = "";
+				const punctMatch = url.match(this.trailingPunctRegex);
+				if (punctMatch) {
+					trailingPunct = punctMatch[1];
+					url = url.slice(0, -trailingPunct.length);
 				}
-			});
-		});
 
-		return newContent;
+				const urlObj = new URL(url);
+				const paramsToDelete = [];
+				urlObj.searchParams.forEach((_, key) => {
+					if (this.trackingParamsSet.has(key.toLowerCase())) {
+						paramsToDelete.push(key);
+					}
+				});
+
+				if (paramsToDelete.length > 0) {
+					paramsToDelete.forEach((p) => urlObj.searchParams.delete(p));
+					this.log("stripped tracking params from:", url);
+					let cleanUrl = urlObj.toString();
+					if (cleanUrl.endsWith("?")) {
+						cleanUrl = cleanUrl.slice(0, -1);
+					}
+					return cleanUrl + trailingPunct;
+				}
+				return url + trailingPunct;
+			} catch (e) {
+				return url;
+			}
+		});
 	}
 
-	removeAmpLinks(content) {
-		const newContent = this.replaceOutsideCode(content, (segment) => {
-			// Google AMP cache: https://www.google.com/amp/s/example.com/article
-			segment = segment.replace(
-				/https?:\/\/(?:www\.)?google\.com\/amp\/s\/([^\s]+)/gi,
-				(match, url) => {
-					this.log("removed Google AMP wrapper");
-					return "https://" + url;
-				}
-			);
-
-			// Google AMP viewer: https://www.google.com/amp/example.com/article
-			segment = segment.replace(
-				/https?:\/\/(?:www\.)?google\.com\/amp\/([^\s]+)/gi,
-				(match, url) => {
-					this.log("removed Google AMP wrapper");
-					// Add https:// if not present
-					if (!url.startsWith("http")) {
-						return "https://" + url;
-					}
-					return url;
-				}
-			);
-
-			// Bing AMP cache
-			segment = segment.replace(
-				/https?:\/\/(?:www\.)?bing\.com\/amp\/s\/([^\s]+)/gi,
-				(match, url) => {
-					this.log("removed Bing AMP wrapper");
-					return "https://" + url;
-				}
-			);
-
-			// amp. subdomain URLs - only for known news/media domains that use AMP
-			// This whitelist approach prevents breaking legitimate amp.* domains
-			const ampDomains = [
-				"cnn",
-				"bbc",
-				"theguardian",
-				"nytimes",
-				"washingtonpost",
-				"reuters",
-				"forbes",
-				"wired",
-				"techcrunch",
-				"theverge",
-				"engadget",
-				"arstechnica",
-				"businessinsider",
-				"huffpost",
-				"nbcnews",
-				"cbsnews",
-				"abcnews",
-				"usatoday",
-				"time",
-				"newsweek",
-				"thehill",
-				"politico",
-				"vox",
-				"slate",
-				"salon",
-				"dailymail",
-				"independent",
-				"telegraph",
-				"mirror",
-				"express",
-				"standard",
-				"9to5google",
-				"9to5mac",
-				"androidcentral",
-				"tomsguide",
-				"cnet",
-				"zdnet",
-			];
-			const ampDomainsPattern = ampDomains.join("|");
-			segment = segment.replace(
-				new RegExp(
-					`https?:\\/\\/amp\\.((?:${ampDomainsPattern})\\.\\w+)(\\/[^\\s]*)?`,
-					"gi"
-				),
-				(match, domain, path) => {
-					this.log("removed amp. subdomain from:", domain);
-					return "https://" + domain + (path || "");
-				}
-			);
-
-			// /amp/ in path
-			segment = segment.replace(
-				/(https?:\/\/[^\s\/]+)\/amp(\/[^\s]*)?/gi,
-				(match, base, path) => {
-					this.log("removed /amp/ from path");
-					return base + (path || "");
-				}
-			);
-
-			return segment;
+	removeAmpLinks(segment) {
+		// Google AMP cache
+		this.googleAmpCacheRegex.lastIndex = 0;
+		segment = segment.replace(this.googleAmpCacheRegex, (match, url) => {
+			this.log("removed Google AMP wrapper");
+			return "https://" + url;
 		});
 
-		return newContent;
+		// Google AMP viewer
+		this.googleAmpViewerRegex.lastIndex = 0;
+		segment = segment.replace(this.googleAmpViewerRegex, (match, url) => {
+			this.log("removed Google AMP wrapper");
+			if (!url.startsWith("http")) {
+				return "https://" + url;
+			}
+			return url;
+		});
+
+		// Bing AMP cache
+		this.bingAmpRegex.lastIndex = 0;
+		segment = segment.replace(this.bingAmpRegex, (match, url) => {
+			this.log("removed Bing AMP wrapper");
+			return "https://" + url;
+		});
+
+		// amp. subdomain URLs
+		this.ampSubdomainRegex.lastIndex = 0;
+		segment = segment.replace(this.ampSubdomainRegex, (match, domain, path) => {
+			this.log("removed amp. subdomain from:", domain);
+			return "https://" + domain + (path || "");
+		});
+
+		// /amp/ in path
+		this.ampPathRegex.lastIndex = 0;
+		segment = segment.replace(this.ampPathRegex, (match, base, path) => {
+			this.log("removed /amp/ from path");
+			return base + (path || "");
+		});
+
+		return segment;
 	}
 
-	cleanAmazonLinks(content) {
-		const newContent = this.replaceOutsideCode(content, (segment) => {
-			// Match Amazon product URLs and simplify them
-			// Supports: amazon.com, amazon.co.uk, amazon.de, amazon.fr, etc.
-			const amazonRegex =
-				/(https?:\/\/(?:www\.)?amazon\.(?:com|co\.uk|de|fr|it|es|ca|com\.au|co\.jp|in|com\.br|com\.mx|nl|se|pl|sg|ae|sa|eg|tr))\/(.*?\/)?(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})(?:\/[^\s]*)?/gi;
-
-			segment = segment.replace(amazonRegex, (match, domain, _middle, asin) => {
+	cleanAmazonLinks(segment) {
+		this.amazonProductRegex.lastIndex = 0;
+		segment = segment.replace(
+			this.amazonProductRegex,
+			(match, domain, _middle, asin) => {
 				this.log("cleaned Amazon link, ASIN:", asin);
 				return `${domain}/dp/${asin}`;
-			});
-
-			// Also handle amzn.to and amzn.com short links - can't expand them client-side
-			// but we can at least strip ref params from regular amazon links
-			segment = segment.replace(
-				/(https?:\/\/(?:www\.)?amazon\.[a-z.]+\/[^\s?]+)\?[^\s]*/gi,
-				(match, baseUrl) => {
-					// Keep the base URL, strip all query params (they're all tracking)
-					if (baseUrl.includes("/dp/") || baseUrl.includes("/gp/")) {
-						this.log("stripped Amazon tracking params");
-						return baseUrl;
-					}
-					return match;
-				}
-			);
-
-			return segment;
-		});
-
-		return newContent;
-	}
-
-	processSongLinks(content) {
-		// Convert music streaming URLs to song.link for universal sharing
-		const musicPatterns = [
-			// Spotify
-			/https?:\/\/open\.spotify\.com\/(track|album|playlist|artist)\/([a-zA-Z0-9]+)(\?[^\s]*)?/gi,
-			// Apple Music
-			/https?:\/\/music\.apple\.com\/[a-z]{2}\/(album|playlist|song|artist)\/[^\s]+/gi,
-			// YouTube Music
-			/https?:\/\/music\.youtube\.com\/(watch\?v=|playlist\?list=|channel\/)[^\s]+/gi,
-			// Tidal
-			/https?:\/\/(?:listen\.)?tidal\.com\/(track|album|playlist|artist)\/[^\s]+/gi,
-			// Deezer
-			/https?:\/\/(?:www\.)?deezer\.com\/[a-z]{2}\/(track|album|playlist|artist)\/[^\s]+/gi,
-			// Amazon Music
-			/https?:\/\/music\.amazon\.com\/[^\s]+/gi,
-			// SoundCloud (tracks only, not profiles)
-			/https?:\/\/soundcloud\.com\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+(?:\?[^\s]*)?/gi,
-		];
-
-		let newContent = content;
-
-		newContent = this.replaceOutsideCode(newContent, (segment) => {
-			for (const pattern of musicPatterns) {
-				pattern.lastIndex = 0;
-				segment = segment.replace(pattern, (match) => {
-					// Clean trailing punctuation
-					let trailing = "";
-					const punctMatch = match.match(/([.,!?)\]}>]+)$/);
-					if (punctMatch) {
-						trailing = punctMatch[1];
-						match = match.slice(0, -trailing.length);
-					}
-
-					this.log("converted to song.link:", match);
-					// song.link expects the URL as a path segment, not query param
-					// Use encodeURIComponent but only on the parts that need it
-					// The URL is already percent-encoded, so we just need to escape
-					// characters that are special in URL paths (/, ?, #, etc.)
-					const encodedUrl = match
-						.replace(/%/g, "%25") // Escape existing percent signs first
-						.replace(/\?/g, "%3F") // Escape query string marker
-						.replace(/#/g, "%23") // Escape fragment marker
-						.replace(/&/g, "%26"); // Escape ampersands
-					return `https://song.link/${encodedUrl}${trailing}`;
-				});
 			}
-			return segment;
-		});
-
-		return newContent;
-	}
-
-	applyReplacements(content) {
-		const replacements = [];
-
-		// Only add replacements for enabled platforms
-		if (this.platformToggles.twitter) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?(?:x|twitter)\.com/gi,
-				replacement: "https://fixupx.com",
-				name: "X/Twitter",
-			});
-		}
-
-		if (this.platformToggles.reddit) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?reddit\.com/gi,
-				replacement: "https://rxddit.com",
-				name: "Reddit",
-			});
-		}
-
-		if (this.platformToggles.tiktok) {
-			replacements.push({
-				pattern: /https?:\/\/(?:(?:www|m|vm|vt)\.)?tiktok\.com/gi,
-				replacement: "https://tnktok.com",
-				name: "TikTok",
-			});
-		}
-
-		if (this.platformToggles.instagram) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?instagram\.com/gi,
-				replacement: "https://ddinstagram.com",
-				name: "Instagram",
-			});
-		}
-
-		if (this.platformToggles.bluesky) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?bsky\.app/gi,
-				replacement: "https://bsyy.app",
-				name: "Bluesky",
-			});
-		}
-
-		if (this.platformToggles.threads) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?threads\.net/gi,
-				replacement: "https://fixthreads.net",
-				name: "Threads",
-			});
-		}
-
-		if (this.platformToggles.pixiv) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?pixiv\.net/gi,
-				replacement: "https://phixiv.net",
-				name: "Pixiv",
-			});
-		}
-
-		if (this.platformToggles.twitch) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?clips\.twitch\.tv/gi,
-				replacement: "https://clips.fxtwitch.tv",
-				name: "Twitch Clips",
-			});
-		}
-
-		if (this.platformToggles.medium) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?medium\.com/gi,
-				replacement: "https://scribe.rip",
-				name: "Medium",
-			});
-		}
-
-		if (this.platformToggles.tumblr) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?tumblr\.com/gi,
-				replacement: "https://tpmblr.com",
-				name: "Tumblr",
-			});
-		}
-
-		if (this.platformToggles.deviantart) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?deviantart\.com/gi,
-				replacement: "https://fixdeviantart.com",
-				name: "DeviantArt",
-			});
-		}
-
-		if (this.platformToggles.fourchan) {
-			replacements.push({
-				pattern: /https?:\/\/boards\.4chan\.org/gi,
-				replacement: "https://boards.4channel.org",
-				name: "4chan",
-			});
-		}
-
-		if (this.platformToggles.giphy) {
-			replacements.push({
-				pattern:
-					/https?:\/\/(?:www\.)?giphy\.com\/gifs\/(?:[\w-]+-)?([a-zA-Z0-9]{8,20})(?:\/?(?=\s|$)|\/?$)/gi,
-				replacement: (match, gifId) =>
-					`https://media.giphy.com/media/${gifId}/giphy.gif`,
-				name: "Giphy",
-			});
-		}
-
-		// Note: Tenor support removed - the view page ID doesn't match the CDN media ID,
-		// so we can't reliably convert tenor.com/view URLs to direct GIF links
-
-		if (this.platformToggles.gist) {
-			replacements.push({
-				pattern:
-					/https?:\/\/gist\.github\.com\/([a-zA-Z0-9-]+)\/([a-fA-F0-9]+)(?:\/[\w-]+)?(?:#.*)?/gi,
-				replacement: "https://gist.githubusercontent.com/$1/$2/raw",
-				name: "GitHub Gist",
-			});
-		}
-
-		if (this.platformToggles.pastebin) {
-			replacements.push({
-				pattern: /https?:\/\/(?:www\.)?pastebin\.com\/(?!raw\/)([\w]+)/gi,
-				replacement: "https://pastebin.com/raw/$1",
-				name: "Pastebin",
-			});
-		}
-
-		if (this.platformToggles.imgur) {
-			replacements.push({
-				pattern:
-					/(https?:\/\/)(?:www\.)?imgur\.com\/(?!a\/|gallery\/)([\w]+)(?:\.(\w+))?/gi,
-				replacement: (match, _proto, id, ext) => {
-					return "https://i.imgur.com/" + id + (ext ? "." + ext : ".png");
-				},
-				name: "Imgur",
-			});
-		}
-
-		if (this.platformToggles.steam) {
-			// Steam store links - convert to steamdb for better embeds
-			replacements.push({
-				pattern:
-					/https?:\/\/store\.steampowered\.com\/app\/(\d+)(?:\/[^\s]*)?/gi,
-				replacement: (match, appId) => `https://steamdb.info/app/${appId}/`,
-				name: "Steam Store",
-			});
-		}
-
-		if (replacements.length === 0) {
-			return content;
-		}
-
-		const changed = new Set();
-		const newContent = this.replaceOutsideCode(content, (segment) => {
-			// Pre-mark which patterns are present in this segment for logging
-			replacements.forEach(({ pattern, name }) => {
-				pattern.lastIndex = 0;
-				if (pattern.test(segment)) changed.add(name);
-			});
-
-			// Apply chained replacements in one pass over this segment
-			return replacements.reduce((acc, { pattern, replacement, name }) => {
-				try {
-					pattern.lastIndex = 0;
-					return acc.replace(pattern, replacement);
-				} catch (error) {
-					console.error(`[EmbedFixer] Error in ${name} replacement:`, error);
-					return acc;
-				}
-			}, segment);
-		});
-
-		if (this.debugMode && changed.size > 0) {
-			replacements.forEach(({ name, replacement }) => {
-				if (changed.has(name)) {
-					if (typeof replacement === "string") {
-						this.log(`replaced ${name} links ->`, replacement);
-					} else {
-						this.log(`replaced ${name} links`);
-					}
-				}
-			});
-		}
-
-		return newContent;
-	}
-
-	processPaywalls(content) {
-		let newContent = content;
-
-		const paywalledDomains = [
-			"nytimes.com",
-			"wsj.com",
-			"washingtonpost.com",
-			"ft.com",
-			"economist.com",
-			"theathletic.com",
-			"businessinsider.com",
-			"theatlantic.com",
-			"newyorker.com",
-			"wired.com",
-			"vanityfair.com",
-			"bloomberg.com",
-			"barrons.com",
-			"forbes.com",
-			"fortune.com",
-			"seekingalpha.com",
-			"thedailybeast.com",
-			"politico.com",
-			"thetimes.co.uk",
-			"telegraph.co.uk",
-			"thesundaytimes.co.uk",
-			"spectator.co.uk",
-			"newstatesman.com",
-			"lemonde.fr",
-			"corriere.it",
-			"bild.de",
-			"spiegel.de",
-			"nikkei.com",
-			"haaretz.com",
-			"scmp.com",
-			"afr.com",
-			"theage.com.au",
-			"smh.com.au",
-			"latimes.com",
-			"chicagotribune.com",
-			"bostonglobe.com",
-			"sfchronicle.com",
-			"seattletimes.com",
-			"miamiherald.com",
-			"denverpost.com",
-			"startribune.com",
-			"inquirer.com",
-			"dallasnews.com",
-			"theinformation.com",
-			"stratechery.com",
-			"protocol.com",
-			"arstechnica.com",
-			"harpers.org",
-			"thenation.com",
-			"foreignpolicy.com",
-			"medium.com",
-			"substack.com",
-		];
-
-		const domainPattern = paywalledDomains
-			.map((d) => d.replace(/\./g, "\\."))
-			.join("|");
-		const paywallRegex = new RegExp(
-			`(https?:\\/\\/(?:[\\w-]+\\.)?(?:${domainPattern})\\/[^\\s]+?)((?:[\\.,!\\?\\)\\]\\}>\\\"]|&amp;)+)?(?=\\s|$)`,
-			"gi"
 		);
 
-		newContent = this.replaceOutsideCode(newContent, (segment) =>
-			segment.replace(paywallRegex, (match, urlCore, trailing, offset, src) => {
+		this.amazonTrackingRegex.lastIndex = 0;
+		segment = segment.replace(this.amazonTrackingRegex, (match, baseUrl) => {
+			if (baseUrl.includes("/dp/") || baseUrl.includes("/gp/")) {
+				this.log("stripped Amazon tracking params");
+				return baseUrl;
+			}
+			return match;
+		});
+
+		return segment;
+	}
+
+	processSongLinks(segment) {
+		for (const pattern of this.musicPatterns) {
+			pattern.lastIndex = 0;
+			segment = segment.replace(pattern, (match) => {
+				let trailing = "";
+				const punctMatch = match.match(this.trailingPunctRegex);
+				if (punctMatch) {
+					trailing = punctMatch[1];
+					match = match.slice(0, -trailing.length);
+				}
+
+				this.log("converted to song.link:", match);
+				return `https://song.link/${encodeURIComponent(match)}${trailing}`;
+			});
+		}
+		return segment;
+	}
+
+	applyReplacements(segment) {
+		// Filter to only enabled replacements
+		const activeReplacements = this.embedReplacements.filter(
+			({ key }) => this.platformToggles[key]
+		);
+
+		if (activeReplacements.length === 0) return segment;
+
+		return activeReplacements.reduce((acc, { pattern, replacement, name }) => {
+			try {
+				pattern.lastIndex = 0;
+				return acc.replace(pattern, replacement);
+			} catch (error) {
+				console.error(`[EmbedFixer] Error in ${name} replacement:`, error);
+				return acc;
+			}
+		}, segment);
+	}
+
+	processPaywalls(segment) {
+		this.paywallRegex.lastIndex = 0;
+		return segment.replace(
+			this.paywallRegex,
+			(match, urlCore, trailing, offset, src) => {
 				const before = src.slice(0, offset);
 				if (
 					/(?:archive\.is|removepaywall\.com|12ft\.io)\/?$/i.test(
@@ -916,39 +951,23 @@ module.exports = class EmbedFixer {
 					case "12ft":
 						wrapped = `https://12ft.io/${urlCore}`;
 						break;
-					default: // archive
+					default:
 						wrapped = `https://archive.is/${urlCore}`;
 				}
 				return `${wrapped}${trailing || ""}`;
-			})
+			}
 		);
-
-		if (newContent !== content) {
-			this.log("processed paywalled urls (service:", this.paywallService, ")");
-		}
-
-		return newContent;
 	}
 
-	processYouTubeShorts(content) {
-		const ytShortsPattern =
-			/https?:\/\/(?:(?:www|m)\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]{5,})(\?[^\s]*)?/gi;
-
-		const replaceFn = (m, id, queryParams) => {
+	processYouTubeShorts(segment) {
+		this.ytShortsPattern.lastIndex = 0;
+		return segment.replace(this.ytShortsPattern, (m, id, queryParams) => {
 			const params = queryParams || "";
 			const paramString =
 				params && params.length > 1 ? "&" + params.substring(1) : "";
-			return `https://youtube.com/watch?v=${id}${paramString}`;
-		};
-
-		const newContent = this.replaceOutsideCode(content, (segment) =>
-			segment.replace(ytShortsPattern, replaceFn)
-		);
-
-		if (newContent !== content) {
 			this.log("converted youtube shorts -> full player");
-		}
-		return newContent;
+			return `https://youtube.com/watch?v=${id}${paramString}`;
+		});
 	}
 
 	stop() {
@@ -957,8 +976,13 @@ module.exports = class EmbedFixer {
 				"sendMessage",
 				"editMessage"
 			);
-			if (messageModule && this.originalSendMessage) {
-				messageModule.sendMessage = this.originalSendMessage;
+			if (messageModule) {
+				if (this.originalSendMessage) {
+					messageModule.sendMessage = this.originalSendMessage;
+				}
+				if (this.originalEditMessage) {
+					messageModule.editMessage = this.originalEditMessage;
+				}
 				this.log("plugin stopped successfully");
 			}
 		} catch (error) {
